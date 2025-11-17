@@ -360,11 +360,16 @@ def main():
     factory_reset_count = sum(1 for r in results if r.get("factory_reset", False))
     configured_count = sum(1 for r in results if r["configured"])
 
+    # Get failed IPs
+    failed_ips = [r["ip"] for r in results if not r["success"]]
+
     print(f"\n{'='*60}")
     print(f"Summary:")
     print(f"  Total devices: {len(devices)}")
     print(f"  Flashed successfully: {success_count}")
     print(f"  Failed: {fail_count}")
+    if failed_ips:
+        print(f"    Failed IPs: {', '.join(failed_ips)}")
     if args.factory_reset:
         print(f"  Factory reset: {factory_reset_count}")
     print(f"  Configured: {configured_count}")
