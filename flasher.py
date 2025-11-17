@@ -69,27 +69,48 @@ def discover_wled(timeout):
 # Device Wait & Config
 # ---------------------------------------------------------------------------
 
-def wait_for_device(ip, timeout=60, check_interval=2):
+def wait_for_device(ip, timeout=60, initial_delay=5, check_interval=1):
     """Wait for device to come back online after reboot."""
-    print(f"Waiting for {ip} to come back online (timeout: {timeout}s)...")
+    print(f"[{ip}] Waiting {initial_delay}s before checking...")
+    time.sleep(initial_delay)
 
+    print(f"[{ip}] Checking if device is online (timeout: {timeout}s)...")
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
             r = requests.get(f"http://{ip}", timeout=2)
             if r.status_code == 200:
-                print(f"[OK] {ip} is back online")
-                # Give device a few more seconds to fully initialize
-                print(f"[INFO] Waiting 5s for device to fully initialize...")
-                time.sleep(5)
+                print(f"[{ip}] OK: Device is back online")
                 return True
         except requests.exceptions.RequestException:
             pass
 
         time.sleep(check_interval)
 
-    print(f"[WARNING] {ip} did not come back online within {timeout}s")
+    print(f"[{ip}] WARNING: Device did not come back online within {timeout}s")
     return False
+
+
+def factory_reset_device(ip):
+    """Perform factory reset on WLED device."""
+    url = f"http://{ip}/json/state"
+    config = {"rst": 1}
+
+    print(f"[{ip}] Performing factory reset...")
+
+    try:
+        r = requests.post(url, json=config, timeout=10)
+
+        if r.status_code == 200:
+            print(f"[{ip}] OK: Factory reset command sent")
+            return True
+        else:
+            print(f"[{ip}] ERROR: Factory reset failed with HTTP {r.status_code}")
+            return False
+
+    except requests.exceptions.RequestException as e:
+        print(f"[{ip}] FAIL: Factory reset failed: {e}")
+        return False
 
 
 def configure_device(ip, color_rgb=(200, 100, 50), brightness=16):
@@ -132,19 +153,31 @@ def configure_device(ip, color_rgb=(200, 100, 50), brightness=16):
 # OTA Flash Operation
 # ---------------------------------------------------------------------------
 
-def flash_and_configure_device(ip, firmware_path, max_retries=2):
+def flash_and_configure_device(ip, firmware_path, factory_reset=False, max_retries=2):
     """Flash device and configure it after reboot."""
     if not flash_device(ip, firmware_path, max_retries):
-        return {"ip": ip, "success": False, "configured": False}
+        return {"ip": ip, "success": False, "factory_reset": False, "configured": False}
 
-    # Wait for device to reboot and come back online
-    if wait_for_device(ip, timeout=60):
-        # Configure device with default settings
-        configured = configure_device(ip, color_rgb=(50, 20, 110), brightness=64)
-        return {"ip": ip, "success": True, "configured": configured}
-    else:
-        print(f"[WARNING] Skipping config for {ip} - device not reachable")
-        return {"ip": ip, "success": True, "configured": False}
+    # Wait for device to reboot and come back online after flash
+    if not wait_for_device(ip, timeout=60, initial_delay=5, check_interval=1):
+        print(f"[{ip}] WARNING: Device not reachable after flash, skipping remaining steps")
+        return {"ip": ip, "success": True, "factory_reset": False, "configured": False}
+
+    # Factory reset if requested
+    reset_success = False
+    if factory_reset:
+        if factory_reset_device(ip):
+            reset_success = True
+            # Wait for device to reboot after factory reset
+            if not wait_for_device(ip, timeout=60, initial_delay=3, check_interval=1):
+                print(f"[{ip}] WARNING: Device not reachable after factory reset, skipping config")
+                return {"ip": ip, "success": True, "factory_reset": reset_success, "configured": False}
+        else:
+            print(f"[{ip}] WARNING: Factory reset failed, continuing with config")
+
+    # Configure device with default settings
+    configured = configure_device(ip, color_rgb=(50, 20, 110), brightness=64)
+    return {"ip": ip, "success": True, "factory_reset": reset_success, "configured": configured}
 
 
 def flash_device(ip, firmware_path, max_retries=2):
@@ -272,6 +305,12 @@ def main():
         help="Specific IP address to flash (skips mDNS discovery)"
     )
 
+    parser.add_argument(
+        "--factory-reset",
+        action="store_true",
+        help="Perform factory reset after flashing and before configuration"
+    )
+
     args = parser.parse_args()
 
     # If specific IP is provided, use that instead of discovery
@@ -305,7 +344,7 @@ def main():
     with ThreadPoolExecutor(max_workers=len(devices)) as executor:
         # Submit all flash jobs
         future_to_ip = {
-            executor.submit(flash_and_configure_device, ip, args.firmware): ip
+            executor.submit(flash_and_configure_device, ip, args.firmware, args.factory_reset): ip
             for ip in devices
         }
 
@@ -318,6 +357,7 @@ def main():
     # Print summary
     success_count = sum(1 for r in results if r["success"])
     fail_count = len(results) - success_count
+    factory_reset_count = sum(1 for r in results if r.get("factory_reset", False))
     configured_count = sum(1 for r in results if r["configured"])
 
     print(f"\n{'='*60}")
@@ -325,6 +365,8 @@ def main():
     print(f"  Total devices: {len(devices)}")
     print(f"  Flashed successfully: {success_count}")
     print(f"  Failed: {fail_count}")
+    if args.factory_reset:
+        print(f"  Factory reset: {factory_reset_count}")
     print(f"  Configured: {configured_count}")
     print(f"{'='*60}")
 
