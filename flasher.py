@@ -2,11 +2,12 @@
 #!/usr/bin/env python3
 
 """
-Bulk OTA update for all WLED devices on the network.
+Bulk OTA update for WLED devices on the network.
 
 Examples:
-    python3 bulk_wled_ota.py --dry-run
-    python3 bulk_wled_ota.py --firmware my_wled.bin
+    python3 flasher.py --dry-run
+    python3 flasher.py --firmware wled.bin
+    python3 flasher.py --ip 192.168.1.100 --firmware wled.bin
 """
 
 import argparse
@@ -14,6 +15,7 @@ import time
 import threading
 import requests
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from zeroconf import Zeroconf, ServiceBrowser
 
 
@@ -130,68 +132,111 @@ def configure_device(ip, color_rgb=(200, 100, 50), brightness=16):
 # OTA Flash Operation
 # ---------------------------------------------------------------------------
 
-def flash_device(ip, firmware_path):
+def flash_and_configure_device(ip, firmware_path, max_retries=2):
+    """Flash device and configure it after reboot."""
+    if not flash_device(ip, firmware_path, max_retries):
+        return {"ip": ip, "success": False, "configured": False}
+
+    # Wait for device to reboot and come back online
+    if wait_for_device(ip, timeout=60):
+        # Configure device with default settings
+        configured = configure_device(ip, color_rgb=(50, 20, 110), brightness=64)
+        return {"ip": ip, "success": True, "configured": configured}
+    else:
+        print(f"[WARNING] Skipping config for {ip} - device not reachable")
+        return {"ip": ip, "success": True, "configured": False}
+
+
+def flash_device(ip, firmware_path, max_retries=2):
     url = f"http://{ip}/update"
-    print(f"Flashing {ip}...")
+    print(f"[{ip}] Flashing...")
 
-    try:
-        # First verify device is reachable
+    for attempt in range(1, max_retries + 1):
         try:
-            check = requests.get(f"http://{ip}", timeout=5)
-            print(f"[INFO] Device {ip} is reachable (HTTP {check.status_code})")
-        except requests.exceptions.RequestException as e:
-            print(f"[ERROR] Cannot reach device at {ip}: {e}")
-            return False
+            if attempt > 1:
+                print(f"[{ip}] Retry attempt {attempt}/{max_retries}...")
+                time.sleep(2)  # Brief pause before retry
 
-        # Try newer form field name first ("update" for 0.13-0.15)
-        with open(firmware_path, "rb") as fw:
-            files = {"update": ("firmware.bin", fw, "application/octet-stream")}
-            # Increase timeout for large firmware files
-            r = requests.post(url, files=files, timeout=120)
+            # First verify device is reachable
+            try:
+                check = requests.get(f"http://{ip}", timeout=5)
+                print(f"[{ip}] Device is reachable (HTTP {check.status_code})")
+            except requests.exceptions.RequestException as e:
+                print(f"[{ip}] ERROR: Cannot reach device: {e}")
+                if attempt == max_retries:
+                    return False
+                continue
 
-        print(f"[DEBUG] Status code: {r.status_code}")
-        print(f"[DEBUG] Response text: {r.text[:200]}")
-
-        # Check for success indicators in response
-        if r.status_code == 200:
-            response_lower = r.text.lower()
-            # WLED typically responds with "Update Success" or similar
-            if "success" in response_lower or "update" in response_lower:
-                print(f"[OK] {ip} firmware uploaded successfully. Device should reboot.")
-                return True
-            else:
-                print(f"[WARNING] {ip} returned 200 but unexpected response: {r.text[:100]}")
-                # Try with alternate field name "file" for 0.16+
-                print(f"[INFO] Retrying with alternate form field name...")
+            # Try newer form field name first ("update" for 0.13-0.15)
+            print(f"[{ip}] Uploading firmware... (this may take 1-2 minutes)")
+            try:
                 with open(firmware_path, "rb") as fw:
-                    files = {"file": ("firmware.bin", fw, "application/octet-stream")}
-                    r = requests.post(url, files=files, timeout=120)
+                    files = {"update": ("firmware.bin", fw, "application/octet-stream")}
+                    # Use shorter timeout - device may not respond if flashing succeeds
+                    r = requests.post(url, files=files, timeout=60)
+                print(f"[{ip}] Upload completed, checking response...")
 
-                print(f"[DEBUG] Retry status code: {r.status_code}")
-                print(f"[DEBUG] Retry response text: {r.text[:200]}")
+                # Check for success indicators in response
+                if r.status_code == 200:
+                    response_lower = r.text.lower()
+                    # WLED typically responds with "Update Success" or similar
+                    # Also accept empty response as device may reboot immediately
+                    if "success" in response_lower or "update" in response_lower or len(r.text.strip()) == 0:
+                        print(f"[{ip}] OK: Firmware uploaded successfully. Device should reboot.")
+                        return True
+                    else:
+                        print(f"[{ip}] WARNING: Unexpected response, trying alternate form field...")
+                        # Try with alternate field name "file" for 0.16+
+                        with open(firmware_path, "rb") as fw:
+                            files = {"file": ("firmware.bin", fw, "application/octet-stream")}
+                            r = requests.post(url, files=files, timeout=60)
 
-                if r.status_code == 200 and ("success" in r.text.lower() or "update" in r.text.lower()):
-                    print(f"[OK] {ip} firmware uploaded successfully. Device should reboot.")
+                        if r.status_code == 200:
+                            print(f"[{ip}] OK: Firmware uploaded successfully. Device should reboot.")
+                            return True
+                        else:
+                            print(f"[{ip}] ERROR: Both form field names failed")
+                            if attempt == max_retries:
+                                return False
+                            continue
+                else:
+                    print(f"[{ip}] ERROR: HTTP {r.status_code}")
+                    if attempt == max_retries:
+                        return False
+                    continue
+            except requests.exceptions.ChunkedEncodingError:
+                # Device may close connection immediately after successful upload
+                print(f"[{ip}] OK: Connection closed by device (likely successful flash)")
+                return True
+            except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
+                # Check if it's due to device rebooting after successful upload
+                error_str = str(e)
+                if "RemoteDisconnected" in error_str or "Connection reset" in error_str or "Read timed out" in error_str:
+                    print(f"[{ip}] OK: Connection issue during response (likely successful flash)")
                     return True
                 else:
-                    print(f"[ERROR] Both form field names failed")
-                    return False
-        else:
-            print(f"[ERROR] {ip} returned HTTP {r.status_code}: {r.text[:200]}")
-            return False
+                    raise  # Re-raise if it's a different connection error
 
-    except requests.exceptions.Timeout:
-        print(f"[FAIL] {ip}: Request timed out")
-        return False
-    except requests.exceptions.ConnectionError as e:
-        print(f"[FAIL] {ip}: Connection failed - {e}")
-        return False
-    except FileNotFoundError:
-        print(f"[FAIL] Firmware file not found: {firmware_path}")
-        return False
-    except Exception as e:
-        print(f"[FAIL] {ip}: {type(e).__name__}: {e}")
-        return False
+        except requests.exceptions.Timeout:
+            print(f"[{ip}] FAIL: Request timed out on attempt {attempt}/{max_retries}")
+            if attempt == max_retries:
+                return False
+            continue
+        except requests.exceptions.ConnectionError as e:
+            print(f"[{ip}] FAIL: Connection failed on attempt {attempt}/{max_retries}")
+            if attempt == max_retries:
+                return False
+            continue
+        except FileNotFoundError:
+            print(f"[{ip}] FAIL: Firmware file not found: {firmware_path}")
+            return False
+        except Exception as e:
+            print(f"[{ip}] FAIL: {type(e).__name__}: {e}")
+            if attempt == max_retries:
+                return False
+            continue
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -253,25 +298,35 @@ def main():
     if not devices:
         return
 
-    print(f"\nUpdating {len(devices)} device(s) using firmware: {args.firmware}\n")
+    print(f"\nUpdating {len(devices)} device(s) using firmware: {args.firmware}")
+    print(f"Processing devices in parallel...\n")
 
-    success_count = 0
-    fail_count = 0
+    # Flash all devices in parallel
+    with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+        # Submit all flash jobs
+        future_to_ip = {
+            executor.submit(flash_and_configure_device, ip, args.firmware): ip
+            for ip in devices
+        }
 
-    for ip in devices:
-        if flash_device(ip, args.firmware):
-            success_count += 1
+        # Collect results as they complete
+        results = []
+        for future in as_completed(future_to_ip):
+            result = future.result()
+            results.append(result)
 
-            # Wait for device to reboot and come back online
-            if wait_for_device(ip, timeout=60):
-                # Configure device with default settings
-                configure_device(ip, color_rgb=(50, 20, 110), brightness=64)
-            else:
-                print(f"[WARNING] Skipping config for {ip} - device not reachable")
-        else:
-            fail_count += 1
+    # Print summary
+    success_count = sum(1 for r in results if r["success"])
+    fail_count = len(results) - success_count
+    configured_count = sum(1 for r in results if r["configured"])
 
-    print(f"\nDone. Success: {success_count}, Failed: {fail_count}")
+    print(f"\n{'='*60}")
+    print(f"Summary:")
+    print(f"  Total devices: {len(devices)}")
+    print(f"  Flashed successfully: {success_count}")
+    print(f"  Failed: {fail_count}")
+    print(f"  Configured: {configured_count}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
