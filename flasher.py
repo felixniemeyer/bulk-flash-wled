@@ -296,8 +296,8 @@ def main():
     parser.add_argument(
         "--timeout",
         type=int,
-        default=3,
-        help="Time (seconds) to scan for WLED devices using mDNS (default: 3)"
+        default=15,
+        help="Time (seconds) to scan for WLED devices using mDNS (default: 15)"
     )
 
     parser.add_argument(
